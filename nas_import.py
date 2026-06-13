@@ -24,7 +24,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from collections import Counter
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
@@ -212,12 +212,21 @@ def parsed_cache_sidecar(checkpoint_file: Path, batch_index: int) -> Path:
     return checkpoint_file.parent / f"{checkpoint_file.stem}.batch_{batch_index:04d}.parsed.jsonl"
 
 
-def append_jsonl_line(path: Path, payload: dict) -> None:
+def append_jsonl_lines(path: Path, payloads: Iterable[dict]) -> int:
+    items = list(payloads)
+    if not items:
+        return 0
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        for payload in items:
+            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
         handle.flush()
         os.fsync(handle.fileno())
+    return len(items)
+
+
+def append_jsonl_line(path: Path, payload: dict) -> None:
+    append_jsonl_lines(path, [payload])
 
 
 def read_jsonl(path: Path) -> list[dict]:
@@ -425,6 +434,7 @@ class ImportCheckpoint:
     db_write_task_id: int | None = None
     db_write_dataset_id: int | None = None
     db_write_inserted_count: int = 0
+    parsed_xml_pending: list[dict] = field(default_factory=list, repr=False)
     last_error: str | None = None
 
     @classmethod
@@ -463,12 +473,14 @@ class ImportCheckpoint:
     def mark_batch_completed(self, batch_index: int) -> None:
         if batch_index not in self.completed_batch_indexes:
             self.completed_batch_indexes.append(batch_index)
+        self.flush_parsed_xml_sidecar()
         if _ACTIVE_CHECKPOINT_FILE is not None:
             cleanup_batch_sidecars(_ACTIVE_CHECKPOINT_FILE, batch_index)
         self.active_batch_index = None
         self.active_batch_scanned_dirs = set()
         self.active_batch_files = []
         self.parsed_xml_urls = set()
+        self.parsed_xml_pending = []
         self.phase = "dfs"
         self.file_scan_completed = False
         self.active_batch_file_count = 0
@@ -487,6 +499,7 @@ class ImportCheckpoint:
         self.active_batch_scanned_dirs = set()
         self.active_batch_files = []
         self.parsed_xml_urls = set()
+        self.parsed_xml_pending = []
         self.phase = "batch_files"
         self.file_scan_completed = False
         self.active_batch_file_count = 0
@@ -517,10 +530,11 @@ class ImportCheckpoint:
         self.active_batch_scanned_dirs.add(relative_dir)
         file_dicts = [file.to_dict() for file in files]
         self.active_batch_files.extend(file_dicts)
-        if _ACTIVE_CHECKPOINT_FILE is not None and self.active_batch_index is not None:
-            sidecar = batch_files_sidecar(_ACTIVE_CHECKPOINT_FILE, self.active_batch_index)
-            for item in file_dicts:
-                append_jsonl_line(sidecar, item)
+        if _ACTIVE_CHECKPOINT_FILE is not None and self.active_batch_index is not None and file_dicts:
+            append_jsonl_lines(
+                batch_files_sidecar(_ACTIVE_CHECKPOINT_FILE, self.active_batch_index),
+                file_dicts,
+            )
 
     def is_active_batch_dir_scanned(self, relative_dir: str) -> bool:
         return relative_dir in self.active_batch_scanned_dirs
@@ -531,10 +545,17 @@ class ImportCheckpoint:
     def mark_parsed_xml(self, xml_url: str, parsed_xml: dict) -> None:
         self.parsed_xml_urls.add(xml_url)
         if _ACTIVE_CHECKPOINT_FILE is not None and self.active_batch_index is not None:
-            append_jsonl_line(
-                parsed_cache_sidecar(_ACTIVE_CHECKPOINT_FILE, self.active_batch_index),
-                parsed_xml,
-            )
+            self.parsed_xml_pending.append(parsed_xml)
+
+    def flush_parsed_xml_sidecar(self) -> int:
+        if _ACTIVE_CHECKPOINT_FILE is None or self.active_batch_index is None or not self.parsed_xml_pending:
+            return 0
+        written = append_jsonl_lines(
+            parsed_cache_sidecar(_ACTIVE_CHECKPOINT_FILE, self.active_batch_index),
+            self.parsed_xml_pending,
+        )
+        self.parsed_xml_pending.clear()
+        return written
 
     def record_error(self, error: Exception | str) -> None:
         self.last_error = str(error)
@@ -2095,8 +2116,7 @@ def build_split_dir_batch_report(
             continue
         print_batch_file_scan_progress(batch.index, dir_index, total_dirs, pair.image_dir.relative_dir, len(files))
         before_count = len(files)
-        if checkpoint is not None:
-            save_import_checkpoint(checkpoint_path, checkpoint, force=True)
+        dir_scan_started = time.monotonic()
         try:
             dir_files = list_http_files_in_directory(pair.image_dir, IMAGE_SUFFIXES)
             dir_files.extend(list_http_files_in_directory(pair.xml_dir, {XML_SUFFIX}))
@@ -2110,8 +2130,12 @@ def build_split_dir_batch_report(
             checkpoint.mark_active_batch_dir_scanned(scan_key, dir_files)
             save_import_checkpoint(checkpoint_path, checkpoint, force=True)
         added_count = len(files) - before_count
+        dir_scan_elapsed = time.monotonic() - dir_scan_started
         if added_count:
-            print_progress(f"批次 {batch.index} 文件扫描：当前目录新增 {added_count} 个文件，累计 {len(files)} 个")
+            print_progress(
+                f"批次 {batch.index} 文件扫描：当前目录新增 {added_count} 个文件，"
+                f"累计 {len(files)} 个，本目录用时 {dir_scan_elapsed:.1f}s"
+            )
         if len(files) % SCAN_PROGRESS_EVERY == 0 and len(files) > before_count:
             print_progress(f"批次 {batch.index} 文件扫描：累计已发现 {len(files)} 个图片/XML 文件")
     print_progress(f"批次 {batch.index} 扫描完成：发现 {len(files)} 个图片/XML 文件")
@@ -2197,11 +2221,15 @@ def analyze_files(
                 checkpoint.mark_parsed_xml(xml_url, merged)
                 parsed_count = len(parsed_xml_files) + len(xml_errors)
                 if parsed_count % XML_PROGRESS_EVERY == 0:
+                    flushed = checkpoint.flush_parsed_xml_sidecar()
+                    if flushed:
+                        print_progress(f"{progress_prefix}检查点侧车已落盘 XML {flushed} 条")
                     save_import_checkpoint(checkpoint_path, checkpoint, force=True)
         except RuntimeError as exc:
             if "HTTP 请求失败" in str(exc):
                 if checkpoint is not None:
                     checkpoint.record_error(exc)
+                    checkpoint.flush_parsed_xml_sidecar()
                     save_import_checkpoint(checkpoint_path, checkpoint, force=True)
                 raise RuntimeError(f"{progress_prefix}XML 读取失败：{xml_file['name']}") from exc
             xml_errors.append({"name": xml_file["name"], "url": xml_file["url"], "error": str(exc)})
@@ -2211,6 +2239,9 @@ def analyze_files(
         if parsed_count == len(raw_xml_files) or parsed_count % XML_PROGRESS_EVERY == 0:
             print_progress(f"{progress_prefix}XML 解析进度：{parsed_count}/{len(raw_xml_files)}")
     if checkpoint is not None:
+        flushed = checkpoint.flush_parsed_xml_sidecar()
+        if flushed:
+            print_progress(f"{progress_prefix}检查点侧车已落盘 XML {flushed} 条")
         save_import_checkpoint(checkpoint_path, checkpoint, force=True)
 
     print_progress(f"{progress_prefix}开始配对图片和 XML...")
