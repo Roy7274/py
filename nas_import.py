@@ -47,6 +47,7 @@ DUPLICATE_CHECK_PROGRESS_EVERY = 20
 HTTP_TIMEOUT_SECONDS = 60
 HTTP_RETRY_COUNT = 3
 HTTP_RETRY_DELAY_SECONDS = 2.0
+HTTP_SKIPPABLE_STATUS_CODES = {401, 403, 404, 410}
 
 def format_failure_message(exc: Exception) -> str:
     message = str(exc).strip() or exc.__class__.__name__
@@ -153,6 +154,7 @@ class SyncDfsState:
     paired_dirs: int = 0
     unmatched_image_dirs: int = 0
     unmatched_xml_dirs: int = 0
+    skipped_dirs: int = 0
 
 
 def split_dir_pair_to_dict(pair: SplitDirPair) -> dict:
@@ -414,6 +416,7 @@ class ImportCheckpoint:
     xml_url: str
     batch_size: int
     visited_relative_paths: set[str]
+    skipped_relative_paths: set[str]
     dfs_stack: list[tuple[str, str, str]]
     completed_batch_indexes: list[int]
     batch_index: int
@@ -444,6 +447,7 @@ class ImportCheckpoint:
             xml_url=xml_url,
             batch_size=batch_size,
             visited_relative_paths=set(),
+            skipped_relative_paths=set(),
             dfs_stack=[],
             completed_batch_indexes=[],
             batch_index=0,
@@ -466,6 +470,10 @@ class ImportCheckpoint:
 
     def mark_dir_visited(self, relative_path: str) -> None:
         self.visited_relative_paths.add(relative_path)
+
+    def mark_dir_skipped(self, relative_path: str) -> None:
+        self.mark_dir_visited(relative_path)
+        self.skipped_relative_paths.add(relative_path)
 
     def is_dir_visited(self, relative_path: str) -> bool:
         return relative_path in self.visited_relative_paths
@@ -567,6 +575,7 @@ class ImportCheckpoint:
             "xmlUrl": self.xml_url,
             "batchSize": self.batch_size,
             "visitedRelativePaths": sorted(self.visited_relative_paths),
+            "skippedRelativePaths": sorted(self.skipped_relative_paths),
             "dfsStack": [
                 {"imageDirUrl": image_url, "xmlDirUrl": xml_url, "relativePath": relative_path}
                 for image_url, xml_url, relative_path in self.dfs_stack
@@ -582,6 +591,7 @@ class ImportCheckpoint:
                 "pairedDirs": self.paired_dirs,
                 "unmatchedImageDirs": self.unmatched_image_dirs,
                 "unmatchedXmlDirs": self.unmatched_xml_dirs,
+                "skippedDirs": len(self.skipped_relative_paths),
             },
             "activeBatch": {
                 "batchIndex": self.active_batch_index,
@@ -623,6 +633,7 @@ class ImportCheckpoint:
             xml_url=str(payload.get("xmlUrl") or ""),
             batch_size=int(payload.get("batchSize") or 0),
             visited_relative_paths=set(payload.get("visitedRelativePaths") or []),
+            skipped_relative_paths=set(payload.get("skippedRelativePaths") or []),
             dfs_stack=dfs_stack,
             completed_batch_indexes=[int(value) for value in payload.get("completedBatchIndexes") or []],
             batch_index=int(accumulator.get("batchIndex") or 0),
@@ -662,6 +673,49 @@ class DirectoryLinkParser(html.parser.HTMLParser):
 
 def print_progress(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
+
+
+def extract_http_status(exc: BaseException | None) -> int | None:
+    current: BaseException | None = exc
+    while current is not None:
+        if isinstance(current, urllib.error.HTTPError):
+            return int(current.code)
+        current = current.__cause__
+    return None
+
+
+def format_directory_scan_error(exc: Exception | str) -> str:
+    if isinstance(exc, str):
+        return exc
+    status = extract_http_status(exc)
+    if status is not None:
+        return f"HTTP {status}"
+    message = str(exc).strip()
+    return message or exc.__class__.__name__
+
+
+def is_skippable_directory_error(exc: Exception) -> bool:
+    status = extract_http_status(exc)
+    if status is not None and status in HTTP_SKIPPABLE_STATUS_CODES:
+        return True
+    message = str(exc).lower()
+    for token in ("403", "401", "404", "forbidden", "unauthorized", "not found"):
+        if token in message:
+            return True
+    return False
+
+
+def handle_skippable_directory_scan_failure(
+    relative_path: str,
+    exc: Exception,
+    *,
+    phase: str,
+) -> None:
+    current_path = relative_path or "."
+    print_progress(
+        f"{phase}跳过不可访问目录：{current_path}（{format_directory_scan_error(exc)}，"
+        f"已重试 {HTTP_RETRY_COUNT} 次）"
+    )
 
 
 def normalize_pair_key(name: str) -> str:
@@ -1789,6 +1843,7 @@ def iter_split_dir_batches_dfs(
         paired_dirs=checkpoint.paired_dirs,
         unmatched_image_dirs=checkpoint.unmatched_image_dirs,
         unmatched_xml_dirs=checkpoint.unmatched_xml_dirs,
+        skipped_dirs=len(checkpoint.skipped_relative_paths),
     )
     accumulator = _SplitDirBatchAccumulator(batch_size)
     accumulator.restore_from_checkpoint(checkpoint)
@@ -1834,6 +1889,14 @@ def iter_split_dir_batches_dfs(
             for image_child_url, xml_child_url, child_relative_path in reversed(child_matches):
                 stack.append((image_child_url, xml_child_url, child_relative_path))
         except Exception as exc:
+            if is_skippable_directory_error(exc):
+                handle_skippable_directory_scan_failure(relative_path, exc, phase="同步深扫：")
+                state.skipped_dirs += 1
+                checkpoint.mark_dir_skipped(relative_path)
+                checkpoint.dfs_stack = list(stack)
+                sync_checkpoint_from_dfs(checkpoint, state, accumulator)
+                save_import_checkpoint(checkpoint_path, checkpoint, force=True)
+                continue
             checkpoint.record_error(exc)
             checkpoint.dfs_stack = stack + [(image_dir_url, xml_dir_url, relative_path)]
             sync_checkpoint_from_dfs(checkpoint, state, accumulator)
@@ -1849,8 +1912,11 @@ def iter_split_dir_batches_dfs(
         print_progress(f"目录扫描告警：{state.unmatched_image_dirs} 个图片目录未匹配到 XML 目录")
     if state.unmatched_xml_dirs:
         print_progress(f"目录扫描告警：{state.unmatched_xml_dirs} 个 XML 目录未匹配到图片目录")
+    if state.skipped_dirs:
+        print_progress(f"目录扫描告警：跳过 {state.skipped_dirs} 个不可访问目录（如权限不足或不存在）")
     print_progress(
-        f"目录扫描完成：已扫描目录 {state.scanned_dirs}，匹配目录 {state.paired_dirs}，计划批次 {accumulator.planned_batch_count()}"
+        f"目录扫描完成：已扫描目录 {state.scanned_dirs}，匹配目录 {state.paired_dirs}，"
+        f"跳过目录 {state.skipped_dirs}，计划批次 {accumulator.planned_batch_count()}"
     )
     yield from accumulator.flush_ready()
     final_batch = accumulator.finalize()
@@ -2122,6 +2188,16 @@ def build_split_dir_batch_report(
             dir_files.extend(list_http_files_in_directory(pair.xml_dir, {XML_SUFFIX}))
             files.extend(dir_files)
         except Exception as exc:
+            if is_skippable_directory_error(exc):
+                handle_skippable_directory_scan_failure(
+                    scan_key,
+                    exc,
+                    phase=f"批次 {batch.index} 文件扫描：",
+                )
+                if checkpoint is not None:
+                    checkpoint.mark_active_batch_dir_scanned(scan_key, [])
+                    save_import_checkpoint(checkpoint_path, checkpoint, force=True)
+                continue
             if checkpoint is not None:
                 checkpoint.record_error(exc)
                 save_import_checkpoint(checkpoint_path, checkpoint, force=True)
